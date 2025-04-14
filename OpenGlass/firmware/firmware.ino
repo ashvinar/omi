@@ -8,13 +8,15 @@
 #include "esp_camera.h"
 #include "camera_pins.h"
 #include "mulaw.h"
+#include <SD.h>
+#include <FS.h>
 
 // Audio
 
 // Uncomment to switch the codec
 // Opus is still under development
 // Mulaw is used with the web app
-// PCM is used with the Omi app
+// PCM is used with the Friend app
 
 // To use with the web app, comment CODEC_PCM and
 // uncomment CODEC_MULAW
@@ -35,7 +37,6 @@ OpusEncoder *opus_encoder = nullptr;
 #define CHANNELS 1
 #define MAX_PACKET_SIZE 1000
 
-#define FRAME_SIZE 160
 #define SAMPLE_RATE 16000
 #define SAMPLE_BITS 16
 
@@ -69,7 +70,7 @@ OpusEncoder *opus_encoder = nullptr;
 #define BATTERY_SERVICE_UUID (uint16_t)0x180F
 #define BATTERY_LEVEL_CHAR_UUID (uint16_t)0x2A19
 
-// Main Omi Service
+// Main Friend Service
 static BLEUUID serviceUUID("19B10000-E8F2-537E-4F6C-D104768A1214");
 static BLEUUID audioDataUUID("19B10001-E8F2-537E-4F6C-D104768A1214");
 static BLEUUID audioCodecUUID("19B10002-E8F2-537E-4F6C-D104768A1214");
@@ -81,6 +82,17 @@ BLECharacteristic *photoDataCharacteristic;
 BLECharacteristic *photoControlCharacteristic;
 
 BLECharacteristic *batteryLevelCharacteristic;
+
+//batch transfer
+
+#define MAX_BATCH_PHOTOS 5
+String photoFileNames[MAX_BATCH_PHOTOS];
+int photoCount = 0;
+bool transferringBatch = false;
+File currentPhotoFile;
+int currentPhotoIndex = 0;
+size_t currentPhotoSentBytes = 0;
+
 
 // State
 
@@ -175,18 +187,18 @@ void configure_ble() {
 
   // Device Information Service
 
-  BLEService *deviceInfoService = server->createService(BLEUUID(DEVICE_INFORMATION_SERVICE_UUID));
+  BLEService *deviceInfoService = server->createService(DEVICE_INFORMATION_SERVICE_UUID);
   BLECharacteristic *manufacturerNameCharacteristic = deviceInfoService->createCharacteristic(
-      BLEUUID(MANUFACTURER_NAME_STRING_CHAR_UUID),
+      MANUFACTURER_NAME_STRING_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ);
   BLECharacteristic *modelNumberCharacteristic = deviceInfoService->createCharacteristic(
-      BLEUUID(MODEL_NUMBER_STRING_CHAR_UUID),
+      MODEL_NUMBER_STRING_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ);
   BLECharacteristic *firmwareRevisionCharacteristic = deviceInfoService->createCharacteristic(
-      BLEUUID(FIRMWARE_REVISION_STRING_CHAR_UUID),
+      FIRMWARE_REVISION_STRING_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ);
   BLECharacteristic *hardwareRevisionCharacteristic = deviceInfoService->createCharacteristic(
-      BLEUUID(HARDWARE_REVISION_STRING_CHAR_UUID),
+      HARDWARE_REVISION_STRING_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ);
 
   manufacturerNameCharacteristic->setValue("Based Hardware");
@@ -195,9 +207,9 @@ void configure_ble() {
   hardwareRevisionCharacteristic->setValue("Seeed Xiao ESP32S3 Sense");
 
   // Battery Service
-  BLEService *batteryService = server->createService(BLEUUID(BATTERY_SERVICE_UUID));
+  BLEService *batteryService = server->createService(BATTERY_SERVICE_UUID);
   batteryLevelCharacteristic = batteryService->createCharacteristic(
-      BLEUUID(BATTERY_LEVEL_CHAR_UUID),
+      BATTERY_LEVEL_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   ccc = new BLE2902();
   ccc->setNotifications(true);
@@ -212,8 +224,8 @@ void configure_ble() {
   server->setCallbacks(new ServerHandler());
 
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(BLEUUID(BATTERY_SERVICE_UUID));
-  advertising->addServiceUUID(BLEUUID(DEVICE_INFORMATION_SERVICE_UUID));
+  advertising->addServiceUUID(BATTERY_SERVICE_UUID);
+  advertising->addServiceUUID(DEVICE_INFORMATION_SERVICE_UUID);
   advertising->addServiceUUID(service->getUUID());
   advertising->setScanResponse(true);
   advertising->setMinPreferred(0x06);
@@ -276,13 +288,13 @@ static size_t compressed_buffer_size = MAX_PACKET_SIZE;
 #ifdef CODEC_MULAW
 
 static size_t recording_buffer_size = 400;
-static size_t compressed_buffer_size = 400 + 3; /* header */
+static size_t compressed_buffer_size = 400 + 3;
 #define VOLUME_GAIN 2
 
 #else
 
 static size_t recording_buffer_size = FRAME_SIZE * 2; // 16-bit samples
-static size_t compressed_buffer_size = recording_buffer_size + 3; /* header */
+static size_t compressed_buffer_size = recording_buffer_size + 3;
 #define VOLUME_GAIN 2
 
 #endif
@@ -380,6 +392,12 @@ void setup() {
   // SD.begin(21);
   configure_ble();
   // s_compressed_frame_2 = (uint8_t *) ps_calloc(compressed_buffer_size, sizeof(uint8_t));
+  if (!SD.begin(21)) {
+  Serial.println("Card Mount Failed");
+} else {
+  Serial.println("SD Card initialized.");
+}
+
 #ifdef CODEC_OPUS
   int opus_err;
   opus_encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION, &opus_err);
@@ -491,16 +509,107 @@ void loop() {
       sent_photo_bytes += bytes_to_copy;
       sent_photo_frames++;
     } else {
-      // End flag
+      // End flag for BLE
       s_compressed_frame_2[0] = 0xFF;
       s_compressed_frame_2[1] = 0xFF;
       photoDataCharacteristic->setValue(s_compressed_frame_2, 2);
       photoDataCharacteristic->notify();
 
+      // Save photo to SD card
+    String filename = "/photo_" + String(millis()) + ".jpg";
+    File photoFile = SD.open(filename.c_str(), FILE_WRITE);
+    if (photoFile) {
+      photoFile.write(fb->buf, fb->len);
+      photoFile.close();
+      Serial.println("Photo saved to: " + filename);
+
+      // Store filename for batch
+      if (photoCount < MAX_BATCH_PHOTOS) {
+        photoFileNames[photoCount++] = filename;
+      }
+
+      // If we reached the batch limit, begin batch transfer
+      if (photoCount >= MAX_BATCH_PHOTOS) {
+        transferringBatch = true;
+        currentPhotoIndex = 0;
+        currentPhotoSentBytes = 0;
+      }
+
+    } else {
+      Serial.println("Failed to save photo.");
+    }
+
       photoDataUploading = false;
     }
   }
 
+// Batch transfer photos every 5 captures
+if (transferringBatch && connected) {
+  if (!currentPhotoFile) {
+    currentPhotoFile = SD.open(photoFileNames[currentPhotoIndex]);
+    if (!currentPhotoFile) {
+      Serial.println("Failed to open batch photo file");
+      currentPhotoIndex++;
+      return;
+    }
+  }
+
+  size_t remaining = currentPhotoFile.size() - currentPhotoSentBytes;
+  if (remaining > 0) {
+    size_t chunkSize = (remaining > 200) ? 200 : remaining;
+    currentPhotoFile.read(&s_compressed_frame_2[2], chunkSize);
+    s_compressed_frame_2[0] = currentPhotoSentBytes & 0xFF;
+    s_compressed_frame_2[1] = (currentPhotoSentBytes >> 8) & 0xFF;
+
+    size_t totalLen = chunkSize + 2;
+    size_t offset = 0;
+while (offset < totalLen && connected) {
+  size_t notifySize = (totalLen - offset > 20) ? 20 : totalLen - offset;
+
+  // Only notify if client has enabled notifications
+  auto* desc = photoDataCharacteristic->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+  if (desc && desc->getValue()[0] == 1) {
+    photoDataCharacteristic->setValue(&s_compressed_frame_2[offset], notifySize);
+    esp_err_t err = photoDataCharacteristic->notify();
+    
+    if (err != ESP_OK) {
+      Serial.printf("BLE notify failed: 0x%X\n", err);
+      break; // stop if BLE fails
+    }
+
+    delay(10);  // safer delay to avoid BLE congestion
+  }
+
+  offset += notifySize;
+}
+
+
+    currentPhotoSentBytes += chunkSize;
+  } else {
+    // Send end flag in 20-byte safe format
+    uint8_t endPacket[2] = { 0xFF, 0xFF };
+auto* desc = photoDataCharacteristic->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+if (desc && desc->getValue()[0] == 1 && connected) {
+  photoDataCharacteristic->setValue(endPacket, 2);
+  photoDataCharacteristic->notify();
+  delay(10);
+}
+
+    currentPhotoFile.close();
+    currentPhotoFile = File();
+    currentPhotoIndex++;
+    currentPhotoSentBytes = 0;
+
+    if (currentPhotoIndex >= photoCount) {
+      Serial.println("Finished batch transfer of all 5 photos.");
+      transferringBatch = false;
+      photoCount = 0;
+    }
+  }
+}
+
+
+  
   // Update battery level
   if (now - lastBatteryUpdate > 60000)
   {
@@ -511,3 +620,5 @@ void loop() {
   // Delay
   delay(20);
 }
+
+
